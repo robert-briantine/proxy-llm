@@ -1,0 +1,26 @@
+name: qwen-on-demand
+
+services:
+  proxy:
+    build: ./proxy
+    container_name: qwen-on-demand-proxy
+    platform: linux/arm64
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      VLLM_CONTAINER_NAME: qwen-on-demand-vllm
+      VLLM_BASE_URL: http://qwen-on-demand-vllm:8000
+      DOCKER_NETWORK: qwen-on-demand_default
+      HOST_HOME: ${HOME:?HOME doit pointer vers le dossier utilisateur sur le DGX Spark}
+      HF_TOKEN: ${HF_TOKEN:-}
+      STARTUP_TIMEOUT_SECONDS: "1200"
+      IDLE_TIMEOUT_SECONDS: "1200" # 20 min d'inactivité ; 0 = jamais
+      MODEL_CONFIG_PATH: /app/models.json
+      MODEL_STATE_PATH: /app/data/selection.json
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./proxy/models.json:/app/models.json:ro
+      - ./data:/app/data
+    # Le service vLLM est créé et remplacé exclusivement via l'API Docker.
+    # Il n'y a JAMAIS deux conteneurs d'inférence simultanés.

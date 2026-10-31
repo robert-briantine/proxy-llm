@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Qwen On Demand · DGX Spark</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0b1020;color:#eff5ff}
+*{box-sizing:border-box}body{margin:0 auto;max-width:1120px;padding:22px 20px 48px}
+header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:25px}
+h1{font-size:1.55rem;margin:0}small,.muted{color:#aebbd1}.pill{border-radius:999px;padding:7px 12px;background:#29384d;font-weight:700;font-size:.85rem}
+.pill.ready{background:#163e31;color:#75edbc}.pill.starting{background:#493916;color:#ffe08c}.pill.stopped{background:#482a35;color:#ffb6c9}
+.actions{display:flex;flex-wrap:wrap;gap:10px;margin:20px 0}
+button{font:inherit;border:1px solid #54647c;background:#202f45;color:#f3f7ff;padding:10px 17px;border-radius:10px;cursor:pointer;min-height:43px}
+button.primary{background:#227a61;border-color:#2cbd92}button.danger{background:#792f45;border-color:#b74a69}button:hover{filter:brightness(1.15)}button:disabled{opacity:.48;cursor:not-allowed}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.card,.panel{border:1px solid #2b3950;border-radius:14px;background:#121b2d;padding:17px}
+.card .value{font-size:1.6rem;font-weight:750;margin-top:12px;overflow-wrap:anywhere}.card .label{color:#9fb0c8;font-size:.87rem}
+.panel{margin-top:16px}h2{margin:0 0 14px;font-size:1.1rem}.meta{font-size:.9rem;color:#9fb0c8;line-height:1.8}
+textarea,input,select{font:inherit;background:#0b1322;border:1px solid #3b4c64;border-radius:9px;color:#f3f7ff;padding:12px;width:100%;margin:5px 0 12px}
+select{max-width:100%;width:auto;min-width:320px;margin:0;padding:10px}textarea{resize:vertical;min-height:100px}input[type=number]{max-width:160px}
+pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#0a1222;border:1px solid #2a394f;border-radius:10px;padding:15px;min-height:100px;line-height:1.5}
+.statusline{color:#afc3df;min-height:23px}.warn{border-left:3px solid #dbba62;padding-left:10px;margin-top:14px}
+@media(max-width:830px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:450px){.grid{grid-template-columns:1fr 1fr}.card{padding:12px}.card .value{font-size:1.22rem}body{padding:18px 12px}.actions button{flex:1}}
+</style>
+</head>
+<body>
+<header><div><h1>Smart vLLM · On Demand</h1><small>DGX Spark · 1 seul moteur GPU · changement de modèle à chaud côté proxy</small></div><span class="pill" id="state">Chargement…</span></header>
+<div class="actions"><button id="start" class="primary" type="button">▶ Démarrer</button><button id="stop" class="danger" type="button">■ Arrêter</button><button id="refresh" type="button">↻ Actualiser</button></div>
+<section class="panel">
+  <h2>Modèle actif</h2>
+  <div class="actions" style="align-items:center">
+    <select id="modelSelect" aria-label="Modèle à charger"></select>
+    <button class="primary" id="switch" type="button">⇄ Changer de modèle</button>
+  </div>
+  <div class="meta" id="modelStatus">Chargement des profils…</div>
+  <p class="meta">Le changement est mis en attente jusqu’à la fin des requêtes en cours. Les nouvelles requêtes patientent pendant le chargement. L'URL API et l'identifiant de modèle restent fixes pour Qwen Code.</p>
+</section>
+<p class="statusline" id="message" role="status" aria-live="polite"></p>
+<div class="grid">
+  <section class="card"><div class="label">Débit global en génération</div><div class="value" id="tps">—</div><small>tokens/s, fenêtre de mesure</small></section>
+  <section class="card"><div class="label">KV cache utilisé</div><div class="value" id="kv">—</div><small>mesure vLLM</small></section>
+  <section class="card"><div class="label">Requêtes vLLM actives</div><div class="value" id="requests">—</div><small>requêtes en cours</small></section>
+  <section class="card"><div class="label">Mémoire du conteneur</div><div class="value" id="memory">—</div><small>Docker/cgroup, mémoire unifiée ≠ VRAM exacte</small></section>
+  <section class="card"><div class="label">Tokens générés depuis le démarrage</div><div class="value" id="total">—</div><small>compteur vLLM</small></section>
+  <section class="card"><div class="label">Requêtes en attente</div><div class="value" id="waiting">—</div><small>file du moteur vLLM</small></section>
+  <section class="card"><div class="label">Requêtes traversant le proxy</div><div class="value" id="proxyRequests">—</div><small>protégées contre arrêt automatique</small></section>
+  <section class="card"><div class="label">Arrêt automatique</div><div class="value" id="idle">—</div><small>après la dernière requête</small></section>
+</div>
+<section class="panel">
+  <h2>Tester le modèle (réponse en streaming)</h2>
+  <label for="prompt">Prompt</label><textarea id="prompt">Explique en trois phrases ce qu'est un KV cache.</textarea>
+  <label for="maxTokens">Limite de tokens</label><br/><input type="number" id="maxTokens" min="1" max="8192" value="512" />
+  <div class="actions"><button id="test" class="primary" type="button">▶ Envoyer au modèle</button><button id="clear" type="button">Effacer la réponse</button></div>
+  <div class="meta" id="testStats">Le premier test démarre automatiquement vLLM s'il est arrêté.</div>
+  <pre id="output" aria-live="polite">La réponse apparaîtra ici.</pre>
+</section>
+<section class="panel"><h2>API et état</h2><div class="meta" id="details">Chargement…</div><p class="meta">URL OpenAI compatible : <code>http://127.0.0.1:8000/v1</code> · Dashboard : <code>http://127.0.0.1:8000/</code></p>
+<p class="meta warn">Accès local uniquement. Ce proxy possède des droits élevés sur Docker via son socket.</p></section>
+<script>
+const byId=id=>document.getElementById(id);
+const nf=n=>n==null?'—':Number(n).toLocaleString('fr-FR');
+let model='qwen3.8:27b-mtp',busy=false,testing=false;
+let modelList=[],lastSwitchError=null;
+function msg(s){byId('message').textContent=s||'';}
+function formatMem(bytes){return bytes==null?'—':(bytes/(1024**3)).toFixed(1)+' Gio';}
+async function update(){
+ try{
+  const r=await fetch('/api/status',{cache:'no-store'});
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const d=await r.json();model=d.model;
+  const switching=!!d.pending_model;
+  const label=switching?(d.switch_phase==='waiting'?'Attente fin requêtes…':d.switch_phase==='rollback'?'Restauration…':'Remplacement…'):d.stopping?'Arrêt…':d.starting?'Démarrage…':d.ready?'Prêt':d.status==='running'?'Chargement…':d.status==='exited'||d.status==='created'?'Arrêté':d.status;
+  byId('state').textContent=label;
+  byId('state').className='pill '+(d.ready?'ready':d.starting?'starting':d.status==='running'?'starting':'stopped');
+  const m=d.metrics||{};
+  byId('tps').textContent=m.tokens_per_second==null?'—':m.tokens_per_second.toFixed(1);
+  byId('kv').textContent=m.kv_cache_usage_percent==null?'—':m.kv_cache_usage_percent.toFixed(1)+' %';
+  byId('requests').textContent=nf(m.vllm_requests_running);
+  byId('memory').textContent=formatMem(d.docker_memory_bytes);
+  byId('total').textContent=nf(m.generated_tokens_total);
+  byId('waiting').textContent=nf(m.vllm_requests_waiting);
+  byId('proxyRequests').textContent=nf(d.active_proxy_requests);
+  byId('idle').textContent=d.idle_timeout_seconds?`${d.idle_timeout_seconds/60} min`:'Désactivé';
+  byId('details').textContent=`Modèle public : ${d.model} · Conteneur vLLM : ${d.status} · Health : ${d.health||'—'} · Prêt : ${d.ready?'oui':'non'} · Code de sortie : ${d.exit_code??'—'}`;
+  byId('modelStatus').textContent=`Actif : ${d.active_label} (${d.active_model})`+(switching?` · En attente : ${d.pending_model} · État : ${d.switch_phase} · Requêtes restantes : ${d.active_proxy_requests}`:'')+(d.switch_error?` · Dernier échec : ${d.switch_error}`:'')+(d.last_switch?` · Dernier changement : ${d.last_switch.seconds} s`:'');
+  if(d.switch_error&&d.switch_error!==lastSwitchError){lastSwitchError=d.switch_error;msg('Erreur de changement : '+d.switch_error);}
+  byId('switch').disabled=busy||switching||byId('modelSelect').value===d.active_model;
+  byId('start').disabled=busy||d.ready||d.starting||d.stopping||switching;
+  byId('stop').disabled=busy||testing||switching||d.status!=='running'||d.stopping;
+ }catch(e){byId('state').textContent='Proxy inaccessible';msg(String(e));}
+}
+async function doAction(name){
+ busy=true;msg(name==='start'?'Démarrage demandé : chargement possible de plusieurs minutes…':'Arrêt demandé…');await update();
+ try{const r=await fetch('/api/'+name,{method:'POST'});const d=await r.json();if(!r.ok)throw Error(d.detail||'Erreur '+r.status);msg(name==='start'?'vLLM prêt.':'vLLM arrêté.');}
+ catch(e){msg('Erreur : '+e.message);}finally{busy=false;await update();}
+}
+async function loadModels(){
+ try{
+  const r=await fetch('/api/models',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);
+  const d=await r.json();modelList=d.models;
+  const select=byId('modelSelect');select.textContent='';
+  for(const item of modelList){const option=document.createElement('option');option.value=item.id;option.textContent=item.label+' · '+(item.max_context/1024).toFixed(0)+'K';select.appendChild(option);}
+  select.value=d.active_model;
+ }catch(e){msg('Impossible de charger les profils : '+e.message);}
+}
+byId('modelSelect').addEventListener('change',()=>update());
+byId('switch').addEventListener('click',async()=>{
+ const target=byId('modelSelect').value;if(!target)return;
+ busy=true;msg('Changement demandé vers '+target+'…');
+ try{
+  const r=await fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:target})});
+  const data=await r.json();if(!r.ok)throw Error(data.detail||'HTTP '+r.status);
+  msg(data.changed===false?'Ce modèle est déjà actif.':data.queued?'Changement programmé : attente des requêtes en cours.':'Chargement du nouveau modèle en cours…');
+ }catch(e){msg('Erreur : '+e.message);}
+ finally{busy=false;await update();}
+});
+byId('start').addEventListener('click',()=>doAction('start'));
+byId('stop').addEventListener('click',()=>doAction('stop'));
+byId('refresh').addEventListener('click',update);
+byId('clear').addEventListener('click',()=>{byId('output').textContent='';byId('testStats').textContent='';});
+byId('test').addEventListener('click',async()=>{
+ if(testing)return;
+ testing=true;byId('test').disabled=true;
+ const text=byId('prompt').value.trim();const limit=Math.min(8192,Math.max(1,Math.floor(Number(byId('maxTokens').value)||512)));
+ if(!text){msg('Saisis un prompt.');testing=false;byId('test').disabled=false;return;}
+ const out=byId('output');out.textContent='';msg('Envoi de la requête (démarrage automatique si nécessaire)…');
+ const began=performance.now();let first=null,usedTokens=null;
+ try{
+  const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:[{role:'user',content:text}],max_tokens:limit,temperature:0.6,stream:true,stream_options:{include_usage:true}})});
+  if(!r.ok)throw Error((await r.text()).slice(0,1000));
+  if(!r.body)throw Error('Réponse sans streaming');
+  const reader=r.body.getReader();const decoder=new TextDecoder();let buffer='';
+  function onEvent(event){
+   const data=event.split('\n').filter(s=>s.startsWith('data:')).map(s=>s.slice(5).trim()).join('\n');
+   if(!data||data==='[DONE]')return;
+   try{const payload=JSON.parse(data);const token=payload.choices?.[0]?.delta?.content;
+    if(token){if(first===null)first=performance.now();out.textContent+=token;}
+    if(payload.usage?.completion_tokens!=null)usedTokens=payload.usage.completion_tokens;
+   }catch(_e){}
+  }
+  while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});buffer=buffer.replace(/\r\n/g,'\n');let cut;
+   while((cut=buffer.indexOf('\n\n'))>=0){onEvent(buffer.slice(0,cut));buffer=buffer.slice(cut+2);}
+  }
+  buffer+=decoder.decode();if(buffer.trim())onEvent(buffer);
+  const end=performance.now();const time=((end-began)/1000).toFixed(2);
+  const speed=usedTokens!=null&&first!==null&&end>first?`${(usedTokens/((end-first)/1000)).toFixed(1)} tokens/s (approx.)`:'débit non disponible';
+  byId('testStats').textContent=`Temps total : ${time} s · Temps premier token : ${first==null?'—':((first-began)/1000).toFixed(2)+' s'} · Sortie : ${nf(usedTokens)} tokens · Débit de streaming : ${speed}`;
+  msg('Test terminé.');
+ }catch(e){msg('Erreur test : '+e.message);}finally{testing=false;byId('test').disabled=false;await update();}
+});
+loadModels().then(update);setInterval(update,2500);
+</script>
+</body>
+</html>
