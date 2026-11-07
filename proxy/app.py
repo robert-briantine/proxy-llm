@@ -23,6 +23,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import httpx
 from pydantic import BaseModel
 
+from settings import Settings, SettingsStore
+from trace_store import TraceStore
+from tool_tracker import ResponseObserver, ToolTracker
+from request_trace import RequestTrace
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("qwen_proxy")
 
@@ -35,6 +40,10 @@ STARTUP_TIMEOUT = max(10, int(os.getenv("STARTUP_TIMEOUT_SECONDS", "1200")))
 IDLE_TIMEOUT = max(0, int(os.getenv("IDLE_TIMEOUT_SECONDS", "1200")))
 CONFIG_PATH = Path(os.getenv("MODEL_CONFIG_PATH", "/app/models.json"))
 STATE_PATH = Path(os.getenv("MODEL_STATE_PATH", "/app/data/selection.json"))
+
+loop_settings = SettingsStore(Path(os.getenv("LOOP_SETTINGS_PATH", str(STATE_PATH.parent / "loop-settings.json"))))
+trace_store = TraceStore(Path(os.getenv("TOOL_HISTORY_PATH", str(STATE_PATH.parent / "tool-history.sqlite3"))))
+tool_tracker = ToolTracker(loop_settings, trace_store)
 
 # Configurations figées au démarrage du proxy ; modifier models.json + relancer proxy.
 CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -116,7 +125,8 @@ def find_container():
 
 def profile_digest(model_id: str) -> str:
     config = {
-        "model": MODELS[model_id],
+        "model": {key: value for key, value in MODELS[model_id].items()
+                  if key not in {"supports_thinking", "startup_timeout_seconds"}},
         "public_model_name": PUBLIC_MODEL,
         "host_home": HOST_HOME,
     }
@@ -187,6 +197,18 @@ def stop_remove_sync():
     c.remove()
 
 
+def log_engine_failure_sync(model_id):
+    """Keep bounded startup diagnostics before rollback removes the engine."""
+    c = find_container()
+    if c is not None:
+        output = c.logs(tail=80)[-32768:].decode("utf-8", errors="replace")
+        log.error("Derniers journaux du moteur %s avant restauration :\n%s", model_id, output)
+
+
+def startup_timeout(model_id):
+    return max(10, int(MODELS[model_id].get("startup_timeout_seconds", STARTUP_TIMEOUT)))
+
+
 async def container_state() -> dict:
     def inspect():
         container = find_container()
@@ -216,7 +238,7 @@ async def health_ok(client: httpx.AsyncClient) -> bool:
 
 async def start_engine_locked(client: httpx.AsyncClient, model_id: str):
     """N'utiliser que sous manage_lock, avec les requêtes admises bloquées."""
-    global starting, previous_sample
+    global starting, previous_sample, last_activity
     starting = True
     try:
         def create_or_start():
@@ -233,15 +255,17 @@ async def start_engine_locked(client: httpx.AsyncClient, model_id: str):
                 c.start()
         await asyncio.to_thread(create_or_start)
         previous_sample = None
-        deadline = time.monotonic() + STARTUP_TIMEOUT
+        timeout = startup_timeout(model_id)
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if await health_ok(client):
+                last_activity = time.monotonic()
                 return
             await asyncio.sleep(2)
             state = await container_state()
             if state["status"] not in ("running", "restarting", "created"):
                 raise HTTPException(503, f"vLLM a quitté : {state['status']} (code {state['exit_code']})")
-        raise HTTPException(504, f"vLLM non prêt après {STARTUP_TIMEOUT} s ({model_id})")
+        raise HTTPException(504, f"vLLM non prêt après {timeout} s ({model_id}) ; premier téléchargement des poids ou compilation encore en cours : consulter les journaux du moteur")
     except DockerException as exc:
         raise HTTPException(503, f"Erreur Docker ({model_id}) : {exc}") from exc
     finally:
@@ -311,13 +335,21 @@ async def switch_worker(client: httpx.AsyncClient, target: str):
         async with manage_lock:
             switch_phase = "replacing"
             log.info("Changement vLLM %s -> %s", previous, target)
-            await asyncio.to_thread(stop_remove_sync)
+            # A proxy restart can leave the requested engine still downloading.
+            # Reattach to that matching profile instead of interrupting it again.
+            state = await container_state()
+            if state["engine_profile"] != target:
+                await asyncio.to_thread(stop_remove_sync)
             try:
                 await start_engine_locked(client, target)
             except Exception as exc:
                 log.exception("Chargement de %s impossible, retour à %s", target, previous)
                 switch_error = str(exc)
                 switch_phase = "rollback"
+                try:
+                    await asyncio.to_thread(log_engine_failure_sync, target)
+                except Exception:
+                    log.warning("Journaux du moteur %s indisponibles", target)
                 try:
                     await asyncio.to_thread(stop_remove_sync)
                     await start_engine_locked(client, previous)
@@ -357,6 +389,7 @@ async def auto_stop_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    trace_store.configure(loop_settings.value.loopDetection)
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=None, write=120, pool=15),
         limits=httpx.Limits(max_connections=32), follow_redirects=False,
@@ -372,6 +405,7 @@ async def lifespan(app: FastAPI):
             switch_task.cancel()
             with suppress(asyncio.CancelledError):
                 await switch_task
+        await trace_store.close()
         await app.state.http.aclose()
         if docker_client is not None:
             await asyncio.to_thread(docker_client.close)
@@ -396,11 +430,57 @@ async def list_models():
         "pending_model": pending_model,
         "public_model_name": PUBLIC_MODEL,
         "models": [
-            {"id": key, "label": p["label"], "model": p["model"],
+            {"id": key, "supports_thinking": p.get("supports_thinking", False), "label": p["label"], "model": p["model"],
+             "startup_timeout_seconds": startup_timeout(key),
              "image": p["image"], "max_context": p.get("max_context")}
             for key, p in MODELS.items()
         ],
     }
+
+
+@app.get("/api/loop-settings")
+async def get_loop_settings():
+    return loop_settings.value.model_dump()
+
+
+settings_lock = asyncio.Lock()
+
+
+@app.put("/api/loop-settings")
+async def put_loop_settings(payload: Settings):
+    async with settings_lock:
+        was_enabled = loop_settings.value.loopDetection.enabled
+        try:
+            await asyncio.to_thread(loop_settings.save, payload)
+        except OSError as exc:
+            raise HTTPException(503, "Impossible de sauvegarder les paramètres") from exc
+        # Keep call IDs and recovery budgets when saving settings. A disabled
+        # interval breaks continuity because tools may have been missed.
+        if was_enabled != payload.loopDetection.enabled:
+            for state in tool_tracker.sessions.values():
+                state.tail.clear()
+        trace_store.configure(payload.loopDetection)
+    return loop_settings.value.model_dump()
+
+
+@app.get("/api/traces")
+async def get_traces(limit: int = 30, kind: str = "all"):
+    if kind not in {"all", "tools", "loops", "requests"}:
+        raise HTTPException(422, "Type de trace inconnu")
+    result = await asyncio.to_thread(trace_store.read, max(1, min(limit, 100)), kind=kind)
+    return {**result, "dropped": trace_store.dropped, "storage_errors": trace_store.errors,
+            "disk_bytes": await asyncio.to_thread(trace_store.disk_bytes),
+            "max_disk_bytes": loop_settings.value.loopDetection.maxDiskMB * 1024 * 1024,
+            "trace_enabled": loop_settings.value.loopDetection.traceEnabled,
+            "observation_errors": tool_tracker.failures, "sessions": len(tool_tracker.sessions)}
+
+
+@app.get("/api/traces/{event_id}")
+async def get_trace(event_id: str):
+    result = await asyncio.to_thread(trace_store.read, event_id=event_id)
+    if not result or "id" not in result:
+        raise HTTPException(404, "Trace inconnue ou expirée")
+    return result
 
 
 @app.get("/api/status")
@@ -452,6 +532,7 @@ async def status(request: Request):
         "model": PUBLIC_MODEL, "active_model": selected_model,
         "active_label": MODELS[selected_model]["label"],
         "pending_model": pending_model, "switch_phase": switch_phase,
+        "startup_timeout_seconds": startup_timeout(pending_model or selected_model),
         "switch_error": switch_error, "last_switch": last_switch,
         "active_proxy_requests": active_requests,
         "idle_timeout_seconds": IDLE_TIMEOUT,
@@ -499,6 +580,7 @@ HOP_HEADERS = {
 async def openai_proxy(subpath: str, request: Request):
     client: httpx.AsyncClient = request.app.state.http
     body = await request.body()
+    data = None
     # Tous les profils exposent le même nom public pour éviter de modifier Qwen Code.
     if body and request.method in {"POST", "PUT", "PATCH"} and subpath in {
         "chat/completions", "completions", "responses", "embeddings"
@@ -511,7 +593,14 @@ async def openai_proxy(subpath: str, request: Request):
         except (ValueError, UnicodeDecodeError):
             pass
 
-    await ensure_ready(client, reserve_slot=True)
+    trace = RequestTrace(loop_settings, trace_store, request.method, "/v1/" + subpath, body)
+    try:
+        await ensure_ready(client, reserve_slot=True)
+    except BaseException as exc:
+        trace.record["status"] = getattr(exc, "status_code", None)
+        trace.finish(error=exc)
+        raise
+    trace.record["model"] = selected_model
     url = f"{UPSTREAM}/v1/{subpath}"
     if request.url.query:
         url += "?" + request.url.query
@@ -519,20 +608,55 @@ async def openai_proxy(subpath: str, request: Request):
                if k.lower() not in HOP_HEADERS and k.lower() != "accept-encoding"}
     headers["accept-encoding"] = "identity"
     response = None
+    observer = None
+    session_header = None
     try:
+        if (subpath == "chat/completions" and request.method == "POST"
+                and isinstance(data, dict) and isinstance(data.get("messages"), list)
+                and all(isinstance(m, dict) for m in data["messages"])
+                and (loop_settings.value.loopDetection.enabled or
+                     (loop_settings.value.loopDetection.traceEnabled and loop_settings.value.loopDetection.storeToolHistory))):
+            # Capture after admission: a pending switch may have changed selected_model.
+            model_id = selected_model
+            key, external, reliable = tool_tracker.identify(request.headers, data)
+            if not reliable:
+                session_header = external
+            data = tool_tracker.safe_prepare(key, data, model_id,
+                                            MODELS[model_id].get("supports_thinking", False), reliable)
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            observer = ResponseObserver(tool_tracker, key, model_id, bool(data.get("stream")))
+        trace.request(body)
         upstream_req = client.build_request(request.method, url, content=body, headers=headers)
         response = await client.send(upstream_req, stream=True)
     except (httpx.HTTPError, asyncio.CancelledError) as exc:
+        trace.record["status"] = 502 if isinstance(exc, httpx.HTTPError) else None
+        trace.finish(error=exc)
         await release_slot()
         if isinstance(exc, asyncio.CancelledError):
             raise
         return JSONResponse({"error": f"vLLM inaccessible : {exc}"}, status_code=502)
+    except BaseException as exc:
+        trace.finish(error=exc)
+        await release_slot()
+        raise
 
     response_headers = {k: v for k, v in response.headers.items() if k.lower() not in HOP_HEADERS}
+    trace.record["status"] = response.status_code
+
+    if session_header:
+        response_headers["x-proxy-session-id"] = session_header
+    if response.status_code >= 300:
+        observer = None
 
     async def stream_bytes():
         async for chunk in response.aiter_raw():
+            trace.feed(chunk)
+            if observer is not None:
+                observer.feed(chunk)
             yield chunk
+        if observer is not None:
+            observer.finish()
+        trace.record["complete"] = True
 
     class TrackedStreamingResponse(StreamingResponse):
         async def __call__(self, scope, receive, send):
@@ -544,7 +668,10 @@ async def openai_proxy(subpath: str, request: Request):
                 try:
                     await response.aclose()
                 finally:
-                    await release_slot()
+                    try:
+                        trace.finish(complete=trace.record["complete"])
+                    finally:
+                        await release_slot()
 
     return TrackedStreamingResponse(stream_bytes(), status_code=response.status_code,
                                     headers=response_headers)

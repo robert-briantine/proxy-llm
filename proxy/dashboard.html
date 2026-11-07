@@ -17,7 +17,7 @@ button.primary{background:#227a61;border-color:#2cbd92}button.danger{background:
 .card .value{font-size:1.6rem;font-weight:750;margin-top:12px;overflow-wrap:anywhere}.card .label{color:#9fb0c8;font-size:.87rem}
 .panel{margin-top:16px}h2{margin:0 0 14px;font-size:1.1rem}.meta{font-size:.9rem;color:#9fb0c8;line-height:1.8}
 textarea,input,select{font:inherit;background:#0b1322;border:1px solid #3b4c64;border-radius:9px;color:#f3f7ff;padding:12px;width:100%;margin:5px 0 12px}
-select{max-width:100%;width:auto;min-width:320px;margin:0;padding:10px}textarea{resize:vertical;min-height:100px}input[type=number]{max-width:160px}
+select{max-width:100%;width:auto;min-width:320px;margin:0;padding:10px}textarea{resize:vertical;min-height:100px}input[type=number]{max-width:160px}input[type=checkbox]{width:auto;margin-right:8px}table{width:100%;border-collapse:collapse;font-size:.85rem}td,th{text-align:left;padding:8px;border-bottom:1px solid #2b3950}.scroll{overflow-x:auto}.settings-row{display:flex;gap:20px;flex-wrap:wrap}.settings-row label{display:block}
 pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#0a1222;border:1px solid #2a394f;border-radius:10px;padding:15px;min-height:100px;line-height:1.5}
 .statusline{color:#afc3df;min-height:23px}.warn{border-left:3px solid #dbba62;padding-left:10px;margin-top:14px}
 @media(max-width:830px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -55,6 +55,42 @@ pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-R
   <div class="meta" id="testStats">Le premier test démarre automatiquement vLLM s'il est arrêté.</div>
   <pre id="output" aria-live="polite">La réponse apparaîtra ici.</pre>
 </section>
+<section class="panel">
+  <h2>Détection des boucles</h2>
+  <form id="loopForm">
+    <label><input type="checkbox" id="loopEnabled">Activer la détection</label>
+    <label><input type="checkbox" id="singleClient">Client unique : suivre automatiquement les requêtes sans identifiant de session</label>
+    <div class="settings-row">
+      <label>Répétitions avant détection<br><input id="loopThreshold" type="number" min="2" max="20" required></label>
+      <label>Longueur maximale des cycles<br><input id="loopCycle" type="number" min="1" max="4" required></label>
+      <label>Tentatives de récupération<br><input id="loopAttempts" type="number" min="1" max="10" required></label>
+    </div>
+    <label for="loopMode">Mode de récupération</label><br>
+    <select id="loopMode"><option value="observe">0 · Observation</option><option value="prompt">1 · Prompt correctif</option><option value="thinking">2 · Thinking</option><option value="prompt_and_thinking">3 · Prompt + Thinking</option></select><br>
+    <label for="loopPrompt">Prompt correctif temporaire</label><textarea id="loopPrompt" maxlength="16000"></textarea>
+    <label><input id="loopThinking" type="checkbox">Autoriser le thinking temporaire</label><br>
+    <label><input id="traceEnabled" type="checkbox">Activer les traces (effet immédiat)</label><br>
+    <label><input id="traceAllRequests" type="checkbox">Tracer toutes les requêtes et réponses LLM</label><br>
+    <label><input id="loopStore" type="checkbox">Conserver l’historique des outils dans SQLite</label><br>
+    <label><input id="loopContent" type="checkbox">Enregistrer le contenu des requêtes, réponses et outils après expurgation (peut rester sensible)</label>
+    <div class="settings-row">
+      <label>Conservation (jours)<br><input id="loopDays" type="number" min="1" max="365" required></label>
+      <label>Traces maximales par table<br><input id="loopRows" type="number" min="100" max="100000" required></label>
+      <label>Quota disque des traces (Mio)<br><input id="traceDisk" type="number" min="1" max="102400" required></label>
+      <label>Contenu maximal par requête/réponse (Kio)<br><input id="traceSize" type="number" min="1" max="16384" required></label>
+    </div>
+    <button class="primary" id="loopSave" type="submit">Sauvegarder</button>
+    <p class="meta" id="loopSettingsStatus" role="status"></p>
+  </form>
+  <p class="meta">Le mode client unique suit automatiquement les requêtes sans identifiant. Un identifiant explicite via <code>X-Proxy-Session-ID</code> ou <code>metadata.session_id</code> permet de séparer les conversations si nécessaire. Aucune limite bloquante d’appels d’outils. Le quota disque supprime les traces les plus anciennes.</p>
+</section>
+<section class="panel">
+  <h2>Traces d’exécution</h2>
+  <label for="traceKind">Afficher</label> <select id="traceKind"><option value="all">Toutes les traces</option><option value="requests">Requêtes LLM</option><option value="tools">Appels d’outils</option><option value="loops">Boucles</option></select>
+  <p class="meta" id="traceCounts">Chargement…</p>
+  <div class="scroll"><table><thead><tr><th>Date</th><th>Modèle</th><th>Outils</th><th>Type</th><th>Intervention</th><th>Détails</th></tr></thead><tbody id="traceRows"></tbody></table></div>
+  <pre id="traceDetail" hidden></pre>
+</section>
 <section class="panel"><h2>API et état</h2><div class="meta" id="details">Chargement…</div><p class="meta">URL OpenAI compatible : <code>http://127.0.0.1:8000/v1</code> · Dashboard : <code>http://127.0.0.1:8000/</code></p>
 <p class="meta warn">Accès local uniquement. Ce proxy possède des droits élevés sur Docker via son socket.</p></section>
 <script>
@@ -83,7 +119,7 @@ async function update(){
   byId('proxyRequests').textContent=nf(d.active_proxy_requests);
   byId('idle').textContent=d.idle_timeout_seconds?`${d.idle_timeout_seconds/60} min`:'Désactivé';
   byId('details').textContent=`Modèle public : ${d.model} · Conteneur vLLM : ${d.status} · Health : ${d.health||'—'} · Prêt : ${d.ready?'oui':'non'} · Code de sortie : ${d.exit_code??'—'}`;
-  byId('modelStatus').textContent=`Actif : ${d.active_label} (${d.active_model})`+(switching?` · En attente : ${d.pending_model} · État : ${d.switch_phase} · Requêtes restantes : ${d.active_proxy_requests}`:'')+(d.switch_error?` · Dernier échec : ${d.switch_error}`:'')+(d.last_switch?` · Dernier changement : ${d.last_switch.seconds} s`:'');
+  byId('modelStatus').textContent=`Actif : ${d.active_label} (${d.active_model})`+(switching?` · En attente : ${d.pending_model} · État : ${d.switch_phase} · Requêtes restantes : ${d.active_proxy_requests} · Délai de chargement : ${nf(d.startup_timeout_seconds/60)} min (premier téléchargement inclus)`:'')+(d.switch_error?` · Dernier échec : ${d.switch_error}`:'')+(d.last_switch?` · Dernier changement : ${d.last_switch.seconds} s`:'');
   if(d.switch_error&&d.switch_error!==lastSwitchError){lastSwitchError=d.switch_error;msg('Erreur de changement : '+d.switch_error);}
   byId('switch').disabled=busy||switching||byId('modelSelect').value===d.active_model;
   byId('start').disabled=busy||d.ready||d.starting||d.stopping||switching;
@@ -149,7 +185,73 @@ byId('test').addEventListener('click',async()=>{
   msg('Test terminé.');
  }catch(e){msg('Erreur test : '+e.message);}finally{testing=false;byId('test').disabled=false;await update();}
 });
-loadModels().then(update);setInterval(update,2500);
+let loopSettings=null;
+async function loadLoopSettings(){
+ try{
+  const r=await fetch('/api/loop-settings');if(!r.ok)throw Error('HTTP '+r.status);
+  loopSettings=await r.json();const d=loopSettings.loopDetection,c=loopSettings.recovery;
+  byId('singleClient').checked=d.singleClient;byId('traceEnabled').checked=d.traceEnabled;
+  byId('traceAllRequests').checked=d.traceAllRequests;byId('traceDisk').value=d.maxDiskMB;
+  byId('traceSize').value=d.maxTraceContentKB;
+  byId('loopEnabled').checked=d.enabled;byId('loopThreshold').value=d.repetitionThreshold;
+  byId('loopCycle').value=d.maxCycleLength;byId('loopMode').value=c.mode;
+  byId('loopPrompt').value=c.prompt;byId('loopAttempts').value=c.maxAttempts;
+  byId('loopThinking').checked=c.temporaryThinking;byId('loopStore').checked=d.storeToolHistory;
+  byId('loopContent').checked=d.traceContent;byId('loopDays').value=d.retentionDays;byId('loopRows').value=d.maxTraceRows;
+ }catch(e){byId('loopSettingsStatus').textContent='Chargement impossible : '+e.message;}
+}
+byId('loopForm').addEventListener('submit',async e=>{
+ e.preventDefault();if(!loopSettings)return;byId('loopSave').disabled=true;
+ const value={loopDetection:{...loopSettings.loopDetection,enabled:byId('loopEnabled').checked,
+  singleClient:byId('singleClient').checked,traceEnabled:byId('traceEnabled').checked,
+  traceAllRequests:byId('traceAllRequests').checked,maxDiskMB:Number(byId('traceDisk').value),
+  maxTraceContentKB:Number(byId('traceSize').value),
+  repetitionThreshold:Number(byId('loopThreshold').value),maxCycleLength:Number(byId('loopCycle').value),
+  storeToolHistory:byId('loopStore').checked,traceContent:byId('loopContent').checked,
+  retentionDays:Number(byId('loopDays').value),maxTraceRows:Number(byId('loopRows').value)},
+  recovery:{mode:byId('loopMode').value,prompt:byId('loopPrompt').value,
+  maxAttempts:Number(byId('loopAttempts').value),temporaryThinking:byId('loopThinking').checked}};
+ try{
+  const r=await fetch('/api/loop-settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(value)});
+  if(!r.ok)throw Error('HTTP '+r.status);loopSettings=await r.json();
+  byId('loopSettingsStatus').textContent='Paramètres sauvegardés.';
+ }catch(e){byId('loopSettingsStatus').textContent='Sauvegarde impossible : '+e.message;}
+ finally{byId('loopSave').disabled=false;}
+});
+byId('traceEnabled').addEventListener('change',async()=>{
+ const toggle=byId('traceEnabled');toggle.disabled=true;
+ try{
+  const current=await fetch('/api/loop-settings');if(!current.ok)throw Error('HTTP '+current.status);
+  const value=await current.json();value.loopDetection.traceEnabled=toggle.checked;
+  const r=await fetch('/api/loop-settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(value)});
+  if(!r.ok)throw Error('HTTP '+r.status);loopSettings=await r.json();
+  byId('loopSettingsStatus').textContent=toggle.checked?'Enregistrement des traces activé.':'Enregistrement des traces désactivé. Les traces existantes restent consultables.';
+  await updateTraces();
+ }catch(e){toggle.checked=!toggle.checked;byId('loopSettingsStatus').textContent='Modification impossible : '+e.message;}
+ finally{toggle.disabled=false;}
+});
+byId('traceKind').addEventListener('change',updateTraces);
+async function updateTraces(){
+ try{
+  const r=await fetch('/api/traces?kind='+encodeURIComponent(byId('traceKind').value),{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);
+  const d=await r.json();
+  byId('traceCounts').textContent=`Traces ${d.trace_enabled?'activées':'désactivées'} · Requêtes LLM : ${nf(d.requests)} · Appels d’outils : ${nf(d.tool_calls)} · Boucles : ${nf(d.loops)} · Disque : ${nf((d.disk_bytes/1048576).toFixed(2))} / ${nf(d.max_disk_bytes/1048576)} Mio · Traces abandonnées : ${nf(d.dropped)} · Erreurs de stockage : ${nf(d.storage_errors)}`+(d.unavailable?' · SQLite indisponible':'');
+  const rows=byId('traceRows');rows.textContent='';
+  for(const item of d.recent){
+   const row=document.createElement('tr');
+   for(const text of [new Date(item.timestamp*1000).toLocaleString('fr-FR'),item.model,(item.tools||[]).join(', '),item.kind==='request'?`${item.path} · HTTP ${item.status??'—'}`:item.kind,item.intervention||'—']){
+    const cell=document.createElement('td');cell.textContent=text;row.appendChild(cell);
+   }
+   const cell=document.createElement('td'),button=document.createElement('button');button.type='button';button.textContent='Voir';
+   button.addEventListener('click',async()=>{
+    try{const result=await fetch('/api/traces/'+encodeURIComponent(item.id));if(!result.ok)throw Error('HTTP '+result.status);
+     byId('traceDetail').textContent=JSON.stringify(await result.json(),null,2);byId('traceDetail').hidden=false;
+    }catch(e){msg('Trace indisponible : '+e.message);}
+   });cell.appendChild(button);row.appendChild(cell);rows.appendChild(row);
+  }
+ }catch(e){byId('traceCounts').textContent='Traces indisponibles : '+e.message;}
+}
+loadModels().then(update);loadLoopSettings();updateTraces();setInterval(update,2500);setInterval(updateTraces,5000);
 </script>
 </body>
 </html>

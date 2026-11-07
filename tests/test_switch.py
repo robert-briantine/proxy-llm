@@ -7,6 +7,14 @@ import pytest
 import app as proxy
 
 
+@pytest.fixture(autouse=True)
+def simulated_container_state(monkeypatch):
+    async def state():
+        return {"engine_profile": "qwen27", "status": "running"}
+    monkeypatch.setattr(proxy, "container_state", state)
+    monkeypatch.setattr(proxy, "log_engine_failure_sync", lambda model: None)
+
+
 class FakeContainer:
     def __init__(self, profile, *, status="running"):
         self.attrs = {
@@ -122,6 +130,49 @@ def test_changed_profile_invalidates_existing_container(monkeypatch):
     assert proxy.runtime_profile_id(c) == "flash-next"
     c.attrs["Config"]["Labels"]["qwen.proxy.profile_hash"] = "stale-build"
     assert proxy.runtime_profile_id(c) is None
+
+
+def test_startup_timeout_does_not_recreate_engine(monkeypatch):
+    c = FakeContainer('flash-next')
+    monkeypatch.setitem(proxy.MODELS['flash-next'], 'startup_timeout_seconds', 28800)
+    assert proxy.runtime_profile_id(c) == 'flash-next'
+
+
+@pytest.mark.asyncio
+async def test_switch_reattaches_to_existing_target_after_proxy_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(proxy, 'selected_model', 'qwen27')
+    monkeypatch.setattr(proxy, 'STATE_PATH', tmp_path/'selection.json')
+    proxy.active_requests = 0
+    proxy.no_active_requests.set()
+    proxy.switch_complete.clear()
+    async def state():
+        return {'engine_profile': 'flash-next', 'status': 'running'}
+    async def start(client, model):
+        assert model == 'flash-next'
+    def stop():
+        pytest.fail('The existing Flash-Next download must continue')
+    monkeypatch.setattr(proxy, 'container_state', state)
+    monkeypatch.setattr(proxy, 'start_engine_locked', start)
+    monkeypatch.setattr(proxy, 'stop_remove_sync', stop)
+    await proxy.switch_worker(None, 'flash-next')
+    assert proxy.selected_model == 'flash-next' and proxy.switch_complete.is_set()
+
+
+@pytest.mark.asyncio
+async def test_flash_download_can_exceed_default_timeout_and_resets_idle_clock(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(proxy, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(proxy, 'STARTUP_TIMEOUT', 1200)
+    monkeypatch.setattr(proxy, 'last_activity', 0)
+    monkeypatch.setattr(proxy, 'find_container', lambda: FakeContainer('flash-next'))
+    async def health(client):
+        return clock[0] >= 1800
+    async def sleep(seconds):
+        clock[0] += 600
+    monkeypatch.setattr(proxy, 'health_ok', health)
+    monkeypatch.setattr(proxy.asyncio, 'sleep', sleep)
+    await proxy.start_engine_locked(None, 'flash-next')
+    assert proxy.last_activity == 1800 and not proxy.starting
 
 
 @pytest.mark.asyncio

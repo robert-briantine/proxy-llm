@@ -7,7 +7,11 @@ import types
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ["MODEL_CONFIG_PATH"] = str(ROOT / "proxy" / "models.json")
-os.environ["MODEL_STATE_PATH"] = "/tmp/qwen-proxy-test-selection.json"
+import tempfile
+TEST_DATA = tempfile.TemporaryDirectory(prefix="qwen-proxy-tests-")
+os.environ["MODEL_STATE_PATH"] = str(Path(TEST_DATA.name) / "selection.json")
+os.environ["LOOP_SETTINGS_PATH"] = str(Path(TEST_DATA.name) / "loop-settings.json")
+os.environ["TOOL_HISTORY_PATH"] = str(Path(TEST_DATA.name) / "tool-history.sqlite3")
 
 # Le paquet docker n'est pas présent dans tous les environnements CI.
 if importlib.util.find_spec("docker") is None:

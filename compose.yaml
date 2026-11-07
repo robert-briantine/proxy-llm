@@ -18,6 +18,8 @@ services:
       IDLE_TIMEOUT_SECONDS: "1200" # 20 min d'inactivité ; 0 = jamais
       MODEL_CONFIG_PATH: /app/models.json
       MODEL_STATE_PATH: /app/data/selection.json
+      LOOP_SETTINGS_PATH: /app/data/loop-settings.json
+      TOOL_HISTORY_PATH: /app/data/tool-history.sqlite3
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./proxy/models.json:/app/models.json:ro
